@@ -208,6 +208,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: if hotspotd gets
 your radio wrong, send `hotspotd doctor --json` and `iw list` — that becomes
 a test case.
 
-## License
+## License and attribution
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Use it, change it, fork it, ship it inside
+something commercial. The one condition is that the copyright notice and the
+licence text travel with the code, including into a binary or a distribution
+package, where they belong in the accompanying licence file.
+
+Copyright © 2026 Emir Bera Soğuk. Contributors keep the copyright on what they
+write and release it under the same licence, so the project stays a single MIT
+notice rather than a pile of per-file terms — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Two of the findings behind hotspotd were contributed back to
+[`linux-wifi-hotspot`](https://github.com/lakinduakash/linux-wifi-hotspot)
+and are part of that project under its own BSD-2-Clause licence. If hotspotd
+was useful to you, a link back is appreciated and not required; keeping the
+notice is required.
