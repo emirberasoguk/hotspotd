@@ -29,8 +29,10 @@ install:
 	install -d $(DESTDIR)$(LIBDIR)/hotspotd
 	install -m 644 hotspotd/*.py $(DESTDIR)$(LIBDIR)/hotspotd/
 	install -d $(DESTDIR)$(BINDIR)
-	printf '#!/bin/sh\nexec %s -c "import sys; sys.path.insert(0, \x27%s\x27); from hotspotd.cli import main; sys.exit(main())" "$$@"\n' \
-		"$(PYTHON)" "$(LIBDIR)" > $(DESTDIR)$(BINDIR)/hotspotd
+	{ \
+	  echo '#!/bin/sh'; \
+	  echo 'exec env PYTHONPATH=$(LIBDIR) $(PYTHON) -m hotspotd "$$@"'; \
+	} > $(DESTDIR)$(BINDIR)/hotspotd
 	chmod 755 $(DESTDIR)$(BINDIR)/hotspotd
 	install -d $(DESTDIR)$(MANDIR)
 	install -m 644 man/hotspotd.8 $(DESTDIR)$(MANDIR)/
