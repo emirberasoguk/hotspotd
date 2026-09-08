@@ -62,4 +62,5 @@ jobs:
       - name: man page has no formatting errors
         run: |
           sudo apt-get install -y -qq groff
-          ! groff -man -Tutf8 -ww man/hotspotd.8 2>&1 >/dev/null | grep .
+          groff -man -Tutf8 -ww man/hotspotd.8 > /dev/null 2> warnings.txt
+          if [ -s warnings.txt ]; then cat warnings.txt; exit 1; fi
