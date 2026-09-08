@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotspotd"
+dynamic = ["version"]
+description = "A WiFi access point manager for Linux that tells you why it cannot start"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Emir Bera Soğuk" }]
+keywords = ["wifi", "hotspot", "access-point", "hostapd", "linux", "networking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+# No runtime dependencies, on purpose: hotspotd must work on a machine whose
+# network is down, which is exactly when pip cannot fetch anything.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/emirberasoguk/hotspotd"
+Issues = "https://github.com/emirberasoguk/hotspotd/issues"
+
+[project.scripts]
+hotspotd = "hotspotd.cli:main"
+
+[tool.setuptools]
+packages = ["hotspotd"]
+
+[tool.setuptools.dynamic]
+version = { attr = "hotspotd.__version__" }

@@ -1,0 +1,16 @@
+[Unit]
+Description=hotspotd WiFi access point
+Documentation=man:hotspotd(8)
+After=network-online.target NetworkManager.service wpa_supplicant.service
+Wants=network-online.target
+
+[Service]
+# `up` starts hostapd and dnsmasq and returns; the unit stays "active" to
+# represent the running hotspot, and stopping it tears the hotspot down.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@BINDIR@/hotspotd up
+ExecStop=@BINDIR@/hotspotd down
+
+[Install]
+WantedBy=multi-user.target

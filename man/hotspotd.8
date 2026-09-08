@@ -1,0 +1,180 @@
+.TH HOTSPOTD 8 "2026-09-09" "hotspotd 0.1.0" "System Administration"
+.SH NAME
+hotspotd \- WiFi access point manager that tells you why it cannot start
+.SH SYNOPSIS
+.B hotspotd
+.RI [ options ]
+.I COMMAND
+.RI [ arguments ]
+.SH DESCRIPTION
+.B hotspotd
+brings up a WiFi access point on a Linux machine, sharing the connection the
+machine already has.  The access point runs on its own virtual interface, so
+the uplink you are sharing is not taken away from you.
+.PP
+What sets it apart from the alternatives is
+.BR "hotspotd doctor" :
+before anything is touched, it works out whether an access point can run here
+at all \- whether the radio supports AP mode, which channels the regulatory
+domain actually permits beaconing on, whether an AP may coexist with the
+client connection and under what constraint, and whether the mandatory access
+control policy will let hostapd read its own configuration.  Every one of
+those produces, in other tools, a failure message that points somewhere else.
+.SH COMMANDS
+.TP
+.B doctor
+Report whether an access point can start on this machine, and if not, which
+constraint is in the way and what to do about it.  Exits 0 when ready, 2 when
+blocked.  Run it as root for a complete picture: an unprivileged
+.BR iw (8)
+cannot read the radio's capabilities.
+.TP
+.BI up " SSID"
+Start the access point.  With no
+.I SSID
+the settings saved by a previous
+.B \-\-save
+are used.  The passphrase is asked for interactively unless
+.BR \-\-password ,
+.B \-\-open
+or
+.B $HOTSPOTD_PASS
+supplies one.
+.TP
+.B down
+Stop the running access point and undo every change that starting it made.
+.TP
+.B status
+Show the running access point, how long it has been up, and the clients
+connected to it with their addresses and host names.
+.TP
+.B enable
+Start the saved access point at boot, through
+.BR hotspotd.service (8).
+.TP
+.B disable
+Stop starting it at boot.
+.SH OPTIONS
+Options may be given before or after the command.
+.TP
+.BR \-i ", " \-\-interface " " \fIIFACE\fR
+WiFi interface to use.  The first wireless interface found is the default.
+.TP
+.BR \-p ", " \-\-password " " \fIPASS\fR
+WPA2 passphrase, 8 to 63 characters.  Passing it here makes it visible to
+every user on the machine through
+.BR ps (1);
+prefer the interactive prompt or
+.BR $HOTSPOTD_PASS .
+.TP
+.B \-\-open
+Run an unencrypted network.  Anyone in range can join it and read the traffic
+of everyone on it.
+.TP
+.BR \-c ", " \-\-channel " " \fIN\fR
+Channel to use.  The default is the channel the uplink is already on, because
+many radios \- Intel's AX2xx series among them \- permit a client and an
+access point simultaneously only while both stay on one channel.
+.TP
+.B \-\-ap\-interface \fIIFACE\fR
+Name for the virtual AP interface.  Default
+.BR ap0 .
+An interface that already exists is never taken over.
+.TP
+.B \-\-subnet \fIA.B.C\fR
+First three octets of the hotspot network.  Default
+.BR 192.168.12 .
+.TP
+.B \-\-uplink \fIIFACE\fR
+Interface to share the internet from.  Defaults to the WiFi uplink.
+.TP
+.B \-\-no\-nat
+Do not share any internet connection.
+.TP
+.B \-\-no\-dhcp
+Do not run dnsmasq; clients must configure addresses themselves.
+.TP
+.B \-\-hidden
+Do not broadcast the SSID.
+.TP
+.B \-\-save
+Write these settings to the profile so
+.B hotspotd up
+and the boot service can reuse them.
+.TP
+.B \-\-json
+Machine-readable output, for
+.B doctor
+and
+.BR status .
+.TP
+.B \-\-no\-color
+Disable coloured output.  The
+.B NO_COLOR
+environment variable does the same.
+.SH FILES
+.TP
+.I /etc/hotspotd/hotspotd.conf
+Saved settings, including the passphrase.  Mode 0600.
+.TP
+.I /run/hotspotd/state.json
+The running access point and every change made to bring it up, so that
+.B down
+reverses exactly those and nothing else.
+.TP
+.I /etc/hostapd.hotspotd.conf
+Generated hostapd configuration.  The location is chosen to satisfy the
+active AppArmor policy and is removed when the hotspot stops.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The command failed; the reason is printed on standard error.
+.TP
+.B 2
+.B doctor
+found a blocking problem.
+.SH ENVIRONMENT
+.TP
+.B HOTSPOTD_PASS
+WPA2 passphrase, used when
+.B \-\-password
+is not given.
+.TP
+.B NO_COLOR
+Disable coloured output when set to any value.
+.SH EXAMPLES
+Check the machine before trying anything:
+.PP
+.RS
+.B sudo hotspotd doctor
+.RE
+.PP
+Start an access point, typing the passphrase at the prompt:
+.PP
+.RS
+.B sudo hotspotd up Home
+.RE
+.PP
+Start one and remember it, then have it come back after a reboot:
+.PP
+.RS
+.B sudo hotspotd up Home \-\-save
+.br
+.B sudo hotspotd enable
+.RE
+.SH SEE ALSO
+.BR hostapd (8),
+.BR dnsmasq (8),
+.BR iw (8),
+.BR firewall-cmd (1),
+.BR nft (8)
+.SH BUGS
+Report them at
+.UR https://github.com/emirberasoguk/hotspotd/issues
+.UE .
+Output of
+.B hotspotd doctor \-\-json
+from a radio hotspotd gets wrong is especially useful: it becomes a test case.

@@ -1,0 +1,59 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: run the suite
+        run: make check PYTHON=python
+
+  packaging:
+    name: install and shell files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: make install into a staging root
+        run: |
+          make install DESTDIR="$PWD/staging" PREFIX=/usr
+          test -x staging/usr/bin/hotspotd
+          test -f staging/usr/lib/systemd/system/hotspotd.service
+          test -f staging/usr/share/man/man8/hotspotd.8
+
+      - name: pip install
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          hotspotd --version
+          hotspotd status
+
+      - name: systemd unit is valid
+        run: systemd-analyze verify staging/usr/lib/systemd/system/hotspotd.service
+
+      - name: shellcheck the completion
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=bash contrib/hotspotd.bash
+
+      - name: man page has no formatting errors
+        run: |
+          sudo apt-get install -y -qq groff
+          ! groff -man -Tutf8 -ww man/hotspotd.8 2>&1 >/dev/null | grep .

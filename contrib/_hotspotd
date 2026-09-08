@@ -1,0 +1,52 @@
+#compdef hotspotd
+# zsh completion for hotspotd
+
+_hotspotd_interfaces() {
+    local -a ifaces
+    ifaces=(${(f)"$(ls /sys/class/net 2>/dev/null)"})
+    _describe -t interfaces 'network interface' ifaces
+}
+
+_hotspotd() {
+    local -a commands
+    commands=(
+        'doctor:check whether an access point can run here'
+        'up:start the access point'
+        'down:stop the running access point'
+        'status:show the running access point and its clients'
+        'enable:start the saved hotspot at boot'
+        'disable:stop starting it at boot'
+    )
+
+    _arguments -C \
+        '--version[show version]' \
+        '--no-color[disable coloured output]' \
+        '(-i --interface)'{-i,--interface}'[WiFi interface]:interface:_hotspotd_interfaces' \
+        '1: :->command' \
+        '*:: :->args'
+
+    case $state in
+        command) _describe -t commands 'hotspotd command' commands ;;
+        args)
+            case $words[1] in
+                doctor) _arguments '--json[machine-readable output]' \
+                                   '(-i --interface)'{-i,--interface}'[WiFi interface]:interface:_hotspotd_interfaces' ;;
+                up) _arguments \
+                        '1:network name:' \
+                        '(-p --password)'{-p,--password}'[WPA2 passphrase]:passphrase:' \
+                        '--open[no encryption]' \
+                        '(-c --channel)'{-c,--channel}'[channel]:channel:' \
+                        '--uplink[interface to share from]:interface:_hotspotd_interfaces' \
+                        '--ap-interface[virtual AP interface name]:interface:' \
+                        '--subnet[first three octets]:subnet:' \
+                        '--no-nat[do not share internet]' \
+                        '--no-dhcp[do not run dnsmasq]' \
+                        '--hidden[do not broadcast the SSID]' \
+                        '--save[remember these settings]' ;;
+                status) _arguments '--json[machine-readable output]' ;;
+            esac
+            ;;
+    esac
+}
+
+_hotspotd "$@"

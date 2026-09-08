@@ -2,191 +2,674 @@
 
 Design notes
 ------------
-*Virtual interface.*  The AP lives on its own ``__ap`` interface cloned from
-the radio, the way ``create_ap`` does it.  NetworkManager's own hotspot takes
-the physical device over instead, which drops the very connection you meant
-to share.
+*Virtual interface.*  The AP lives on its own interface cloned from the
+radio, the way ``create_ap`` does it.  NetworkManager's own hotspot takes the
+physical device over instead, which drops the very connection you meant to
+share.
 
 *Config placement.*  The generated hostapd config goes wherever the active
 MAC policy permits (see :mod:`hotspotd.confine`), not to a temp directory.
 
-*Supervision.*  hostapd runs as a transient systemd unit rather than a
-forked background process, so it gets a cgroup, restarts under policy and
-survives the CLI exiting.  ``journalctl -u hotspotd-hostapd`` then just works.
+*Supervision.*  hostapd runs as a transient systemd unit where there is
+systemd, so it gets a cgroup and survives the CLI exiting, and
+``journalctl -u hotspotd-hostapd`` just works.  Elsewhere it is a plain child
+process with its output in a log file.
 
-*NAT.*  firewalld is driven through ``firewall-cmd`` when it is running, so
-we never fight the active backend; otherwise we fall back to nftables.
+*Firewalling.*  Every change is queried before it is made and recorded in
+:mod:`hotspotd.state`, so teardown reverses exactly what this run did.  In
+particular masquerading is only enabled if it was off, and only switched back
+off if we were the ones who turned it on - a machine already sharing another
+connection through that zone must not lose it when the hotspot stops.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
+import time
 from dataclasses import dataclass
+from pathlib import Path
+
+from .state import STATE_DIR, State
 
 HOSTAPD_UNIT = "hotspotd-hostapd"
-DNSMASQ_PID = "/run/hotspotd-dnsmasq.pid"
+DNSMASQ_PID = STATE_DIR / "dnsmasq.pid"
+DNSMASQ_LEASES = STATE_DIR / "dnsmasq.leases"
+HOSTAPD_LOG = STATE_DIR / "hostapd.log"
+NFT_TABLE = "hotspotd"
+NM_CONF = Path("/etc/NetworkManager/conf.d/99-hotspotd.conf")
+IP_FORWARD = Path("/proc/sys/net/ipv4/ip_forward")
+
+# hostapd, iw and friends live in sbin, which is not on a user's PATH.
+_SBIN = ("/usr/sbin", "/sbin", "/usr/local/sbin")
 
 
 class BackendError(RuntimeError):
-    pass
+    """Something we tried to do to the system did not work."""
 
 
-def run(*cmd: str, check: bool = True, quiet: bool = False) -> subprocess.CompletedProcess:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+def which(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _SBIN:
+        candidate = Path(d) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def run(*cmd: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command, raising BackendError with its own words on failure."""
+    exe = which(cmd[0])
+    if exe is None:
+        if check:
+            raise BackendError(f"{cmd[0]} is not installed")
+        return subprocess.CompletedProcess(cmd, 127, "", "")
+    try:
+        proc = subprocess.run((exe,) + cmd[1:], capture_output=True, text=True)
+    except OSError as exc:
+        if check:
+            raise BackendError(f"{cmd[0]}: {exc}") from exc
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
     if check and proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()
+        detail = (proc.stderr or proc.stdout).strip() or f"exit status {proc.returncode}"
         raise BackendError(f"{' '.join(cmd)}: {detail}")
-    if not quiet and proc.returncode != 0:
-        pass
     return proc
+
+
+def ok(*cmd: str) -> bool:
+    """True when the command succeeds; never raises."""
+    return run(*cmd, check=False).returncode == 0
 
 
 @dataclass
 class ApConfig:
+    """What the user asked for."""
+
     ssid: str
     passphrase: str
     channel: int
     hw_mode: str
+    band: str = ""
     ap_iface: str = "ap0"
-    wifi_iface: str = "wlo1"
+    wifi_iface: str = ""
     uplink: str = ""
     subnet: str = "192.168.12"
     hidden: bool = False
-    config_path: str = "/etc/hostapd.hotspotd.conf"
+
+    @property
+    def encrypted(self) -> bool:
+        return bool(self.passphrase)
+
+    @property
+    def gateway(self) -> str:
+        return f"{self.subnet}.1"
+
+    @property
+    def network(self) -> str:
+        return f"{self.subnet}.0/24"
 
     def validate(self) -> None:
-        if not 8 <= len(self.passphrase) <= 63:
-            raise BackendError("WPA2 passphrase must be 8-63 characters")
         if not 1 <= len(self.ssid) <= 32:
             raise BackendError("SSID must be 1-32 characters")
+        if self.passphrase and not 8 <= len(self.passphrase) <= 63:
+            raise BackendError("WPA2 passphrase must be 8-63 characters")
+        parts = self.subnet.split(".")
+        if len(parts) != 3 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            raise BackendError(f"--subnet must be three octets like 192.168.12, got {self.subnet!r}")
 
+
+# --------------------------------------------------------------------------
+# hostapd configuration
+# --------------------------------------------------------------------------
 
 def render_hostapd(cfg: ApConfig) -> str:
-    return "\n".join(
-        [
-            "# generated by hotspotd - do not edit, it is rewritten on every start",
-            f"interface={cfg.ap_iface}",
-            "driver=nl80211",
-            f"ssid={cfg.ssid}",
-            f"hw_mode={cfg.hw_mode}",
-            f"channel={cfg.channel}",
-            "auth_algs=1",
-            f"ignore_broadcast_ssid={1 if cfg.hidden else 0}",
+    lines = [
+        "# generated by hotspotd - rewritten on every start, edits are lost",
+        f"interface={cfg.ap_iface}",
+        "driver=nl80211",
+        f"ssid={cfg.ssid}",
+        f"hw_mode={cfg.hw_mode}",
+        f"channel={cfg.channel}",
+        "auth_algs=1",
+        f"ignore_broadcast_ssid={1 if cfg.hidden else 0}",
+    ]
+    if cfg.encrypted:
+        lines += [
             "wpa=2",
             f"wpa_passphrase={cfg.passphrase}",
             "wpa_key_mgmt=WPA-PSK",
             "rsn_pairwise=CCMP",
-            "",
         ]
-    )
+    return "\n".join(lines) + "\n"
 
 
-def write_config(cfg: ApConfig) -> None:
-    directory = os.path.dirname(cfg.config_path)
-    os.makedirs(directory, exist_ok=True)
+def write_config(cfg: ApConfig, config_path: str, st: State) -> None:
+    directory = os.path.dirname(config_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     old = os.umask(0o077)          # the passphrase is in here
     try:
-        with open(cfg.config_path, "w") as fh:
-            fh.write(render_hostapd(cfg))
+        Path(config_path).write_text(render_hostapd(cfg))
+    except OSError as exc:
+        raise BackendError(f"cannot write {config_path}: {exc}") from exc
     finally:
         os.umask(old)
+    st.did_write_config = True
 
 
-def create_ap_interface(cfg: ApConfig) -> None:
-    run("iw", "dev", cfg.ap_iface, "del", check=False)
+# --------------------------------------------------------------------------
+# interfaces
+# --------------------------------------------------------------------------
+
+def interface_exists(name: str) -> bool:
+    return Path("/sys/class/net", name).exists()
+
+
+def mac_of(iface: str) -> str:
+    try:
+        return Path("/sys/class/net", iface, "address").read_text().strip().lower()
+    except OSError:
+        return ""
+
+
+def _all_macs() -> dict[str, str]:
+    out = {}
+    try:
+        names = [p.name for p in Path("/sys/class/net").iterdir()]
+    except OSError:
+        return out
+    for name in names:
+        mac = mac_of(name)
+        if mac:
+            out[name] = mac
+    return out
+
+
+def distinct_mac(iface: str) -> str | None:
+    """A MAC for *iface* that no other interface is already using.
+
+    A virtual interface cloned off a radio inherits the radio's address, and
+    the kernel refuses to bring the second interface with that address up:
+    `ip link set ap0 up` fails with "Device or resource busy", which says
+    nothing about the cause.  Returns None when the address is already unique
+    and nothing needs changing.
+    """
+    mine = mac_of(iface)
+    if not mine:
+        return None
+    macs = _all_macs()
+    taken = {mac for name, mac in macs.items() if name != iface}
+    if mine not in taken:
+        return None
+
+    head, _, last = mine.rpartition(":")
+    try:
+        base = int(last, 16)
+    except ValueError:
+        return None
+    for step in range(1, 256):
+        candidate = f"{head}:{(base + step) % 256:02x}"
+        if candidate not in taken and candidate != mine:
+            return candidate
+    return None
+
+
+def nm_running() -> bool:
+    return which("nmcli") is not None and ok("nmcli", "-t", "-f", "STATE", "general")
+
+
+def nm_release_interface(iface: str, st: State) -> None:
+    """Tell NetworkManager to leave the interface alone *before* it exists.
+
+    Asking afterwards is too late: NetworkManager claims a new wireless
+    device as soon as it appears, and while it holds it the kernel answers
+    EBUSY to `ip link set up`.  A drop-in under conf.d does it declaratively,
+    so removing the file at teardown restores exactly the previous state -
+    unlike editing NetworkManager.conf itself, which has to be unpicked line
+    by line and stays wrong if the process dies.
+    """
+    if not nm_running():
+        return
+    try:
+        NM_CONF.parent.mkdir(parents=True, exist_ok=True)
+        NM_CONF.write_text(
+            "# Written by hotspotd while a hotspot is running; removed by "
+            "`hotspotd down`.\n"
+            "[keyfile]\n"
+            f"unmanaged-devices=interface-name:{iface}\n"
+        )
+    except OSError as exc:
+        raise BackendError(f"cannot write {NM_CONF}: {exc}") from exc
+    st.did_nm_unmanage = True
+    _nm_reload()
+
+
+def _nm_reload() -> None:
+    if not ok("nmcli", "general", "reload", "conf"):
+        ok("systemctl", "reload", "NetworkManager")
+
+
+def nm_restore(st: State) -> None:
+    if not st.did_nm_unmanage:
+        return
+    NM_CONF.unlink(missing_ok=True)
+    _nm_reload()
+
+
+def _wait_unmanaged(iface: str, seconds: float = 3.0) -> bool:
+    """Wait until NetworkManager really has let go of the interface.
+
+    A freshly created interface is not in NetworkManager's device list yet,
+    so `nmcli device show` fails for a moment.  That is precisely when we
+    still need to wait: treating the error as "done" is how the interface
+    ends up being brought up while NetworkManager is still claiming it.
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        proc = run("nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", iface,
+                   check=False)
+        if proc.returncode == 0 and "unmanaged" in proc.stdout.lower():
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def kernel_hint(iface: str, lines: int = 40) -> str:
+    """Recent kernel messages about this interface or its driver, if any.
+
+    "Device or resource busy" from netlink says nothing on its own; the
+    driver usually did say something, in dmesg, that nobody thought to read.
+    """
+    text = run("journalctl", "-k", "-n", str(lines), "--no-pager", check=False).stdout
+    if not text.strip():
+        text = run("dmesg", "--ctime", check=False).stdout
+        text = "\n".join(text.splitlines()[-lines:])
+    wanted = (iface, "iwlwifi", "ieee80211", "cfg80211", "nl80211")
+    hits = [ln for ln in text.splitlines() if any(w in ln for w in wanted)]
+    return "\n".join(hits[-3:])
+
+
+def _bring_up(iface: str, attempts: int = 4) -> None:
+    """`ip link set up`, retried: the radio may still be settling.
+
+    Creating a virtual interface leaves the driver and NetworkManager both
+    busy with it for a moment, and the kernel answers EBUSY until they are
+    done.  create_ap gets away with never retrying only because it does
+    several seconds of unrelated work in between.
+    """
+    last: BackendError | None = None
+    for attempt in range(attempts):
+        try:
+            run("ip", "link", "set", "up", "dev", iface)
+            return
+        except BackendError as exc:
+            last = exc
+            time.sleep(0.5 * (attempt + 1))
+    hint = kernel_hint(iface)
+    message = str(last)
+    if hint:
+        message += "\n          the kernel said:\n          " + \
+                   "\n          ".join(hint.splitlines())
+    raise BackendError(message)
+
+
+def create_ap_interface(cfg: ApConfig, st: State) -> None:
+    """Clone a virtual AP interface off the radio.
+
+    An interface we did not create is never deleted: it may well belong to
+    something else on the system.
+    """
+    if interface_exists(cfg.ap_iface):
+        raise BackendError(
+            f"interface {cfg.ap_iface} already exists - "
+            f"stop whatever owns it, or choose another with --ap-interface"
+        )
+    if not cfg.wifi_iface:
+        raise BackendError("no wifi interface found (pass one with --interface)")
+
+    # Before creating anything: NetworkManager must not claim the interface
+    # the moment it appears.
+    nm_release_interface(cfg.ap_iface, st)
+
     run("iw", "dev", cfg.wifi_iface, "interface", "add", cfg.ap_iface, "type", "__ap")
-    run("ip", "link", "set", cfg.ap_iface, "up")
-    if shutil.which("nmcli"):
-        run("nmcli", "dev", "set", cfg.ap_iface, "managed", "no", check=False)
+    st.did_create_iface = True
 
+    if st.did_nm_unmanage:
+        _wait_unmanaged(cfg.ap_iface)
+    elif which("nmcli"):
+        ok("nmcli", "dev", "set", cfg.ap_iface, "managed", "no")
 
-def configure_network(cfg: ApConfig) -> None:
+    # The clone inherits the radio's MAC address, and two interfaces on one
+    # phy may not share it - the second refuses to come up with EBUSY.
+    new_mac = distinct_mac(cfg.ap_iface)
+    if new_mac:
+        run("ip", "link", "set", "dev", cfg.ap_iface, "address", new_mac)
+
+    run("ip", "link", "set", "down", "dev", cfg.ap_iface, check=False)
     run("ip", "addr", "flush", "dev", cfg.ap_iface, check=False)
-    run("ip", "addr", "add", f"{cfg.subnet}.1/24", "dev", cfg.ap_iface)
-    run("sysctl", "-qw", "net.ipv4.ip_forward=1")
-    _nat_up(cfg)
+    _bring_up(cfg.ap_iface)
 
 
-def _firewalld_running() -> bool:
-    if not shutil.which("firewall-cmd"):
-        return False
-    return run("firewall-cmd", "--state", check=False).returncode == 0
+def configure_network(cfg: ApConfig, st: State) -> None:
+    run("ip", "addr", "flush", "dev", cfg.ap_iface, check=False)
+    run("ip", "addr", "add", f"{cfg.gateway}/24", "dev", cfg.ap_iface)
+
+    try:
+        previous = IP_FORWARD.read_text().strip()
+    except OSError:
+        previous = ""
+    if previous and previous != "1":
+        IP_FORWARD.write_text("1\n")
+        st.did_ip_forward = previous
+
+    _nat_up(cfg, st)
 
 
-def _nat_up(cfg: ApConfig) -> None:
-    if _firewalld_running():
-        run("firewall-cmd", "-q", "--zone=trusted", f"--add-interface={cfg.ap_iface}", check=False)
-        run("firewall-cmd", "-q", "--zone=public", "--add-masquerade", check=False)
+# --------------------------------------------------------------------------
+# NAT: firewalld when it is running, nftables otherwise
+# --------------------------------------------------------------------------
+
+def firewalld_running() -> bool:
+    return which("firewall-cmd") is not None and ok("firewall-cmd", "--state")
+
+
+def _zone_of(iface: str) -> str:
+    proc = run("firewall-cmd", f"--get-zone-of-interface={iface}", check=False)
+    zone = proc.stdout.strip()
+    if zone and zone != "no zone":
+        return zone
+    return run("firewall-cmd", "--get-default-zone", check=False).stdout.strip()
+
+
+def _nat_up(cfg: ApConfig, st: State) -> None:
+    if firewalld_running():
+        _firewalld_up(cfg, st)
+    elif which("nft"):
+        _nft_up(cfg, st)
+    else:
+        raise BackendError(
+            "no supported firewall backend: install firewalld or nftables, "
+            "or start the hotspot with --no-nat"
+        )
+
+
+def _firewalld_up(cfg: ApConfig, st: State) -> None:
+    """Ask firewalld for what the hotspot needs, the way NetworkManager does.
+
+    firewalld ships an ``nm-shared`` zone for exactly this - target ACCEPT,
+    the dhcp and dns services, icmp - which is what NetworkManager puts a
+    shared connection in.  Older releases without it fall back to ``trusted``.
+    """
+    zone = "nm-shared" if ok("firewall-cmd", "--info-zone=nm-shared") else "trusted"
+
+    old = run("firewall-cmd", f"--get-zone-of-interface={cfg.ap_iface}", check=False).stdout.strip()
+    st.firewalld_ap_old_zone = "" if old in ("", "no zone") else old
+
+    if not ok("firewall-cmd", "-q", f"--zone={zone}", f"--change-interface={cfg.ap_iface}"):
+        raise BackendError(f"firewalld refused to put {cfg.ap_iface} in the {zone} zone")
+    st.firewalld_ap_zone = zone
+
+    if not cfg.uplink:
         return
-    if shutil.which("nft"):
-        run("nft", "add", "table", "ip", "hotspotd", check=False)
-        run("nft", "add", "chain", "ip", "hotspotd", "post",
-            "{ type nat hook postrouting priority 100 ; }", check=False)
-        run("nft", "add", "rule", "ip", "hotspotd", "post",
-            "ip", "saddr", f"{cfg.subnet}.0/24", "oifname", cfg.uplink or "!=", "masquerade",
-            check=False)
+    uplink_zone = _zone_of(cfg.uplink)
+    if not uplink_zone:
         return
-    raise BackendError("neither firewalld nor nft available for NAT")
+    # Only touch masquerading if it is off, so teardown never disables it on a
+    # machine that was sharing another connection through this zone already.
+    if ok("firewall-cmd", "-q", f"--zone={uplink_zone}", "--query-masquerade"):
+        return
+    if ok("firewall-cmd", "-q", f"--zone={uplink_zone}", "--add-masquerade"):
+        st.firewalld_masq_zone = uplink_zone
 
 
-def _nat_down(cfg: ApConfig) -> None:
-    if _firewalld_running():
-        run("firewall-cmd", "-q", "--zone=trusted", f"--remove-interface={cfg.ap_iface}", check=False)
-        run("firewall-cmd", "-q", "--zone=public", "--remove-masquerade", check=False)
-    elif shutil.which("nft"):
-        run("nft", "delete", "table", "ip", "hotspotd", check=False)
+def _nft_up(cfg: ApConfig, st: State) -> None:
+    run("nft", "add", "table", "ip", NFT_TABLE)
+    st.nft_table = NFT_TABLE
+    run("nft", "add", "chain", "ip", NFT_TABLE, "postrouting",
+        "{ type nat hook postrouting priority srcnat ; policy accept ; }")
+    run("nft", "add", "chain", "ip", NFT_TABLE, "forward",
+        "{ type filter hook forward priority filter ; policy accept ; }")
+
+    if cfg.uplink:
+        run("nft", "add", "rule", "ip", NFT_TABLE, "postrouting",
+            "ip", "saddr", cfg.network, "oifname", cfg.uplink, "masquerade")
+    else:
+        run("nft", "add", "rule", "ip", NFT_TABLE, "postrouting",
+            "ip", "saddr", cfg.network, "oifname", "!=", cfg.ap_iface, "masquerade")
+
+    run("nft", "add", "rule", "ip", NFT_TABLE, "forward",
+        "iifname", cfg.ap_iface, "ip", "saddr", cfg.network, "accept")
+    run("nft", "add", "rule", "ip", NFT_TABLE, "forward",
+        "oifname", cfg.ap_iface, "ct", "state", "related,established", "accept")
 
 
-def start_dnsmasq(cfg: ApConfig) -> None:
+def _nat_down(st: State) -> None:
+    if st.firewalld_ap_zone:
+        if st.firewalld_ap_old_zone:
+            ok("firewall-cmd", "-q", f"--zone={st.firewalld_ap_old_zone}",
+               f"--change-interface={st.ap_iface}")
+        else:
+            ok("firewall-cmd", "-q", f"--zone={st.firewalld_ap_zone}",
+               f"--remove-interface={st.ap_iface}")
+    if st.firewalld_masq_zone:
+        ok("firewall-cmd", "-q", f"--zone={st.firewalld_masq_zone}", "--remove-masquerade")
+    if st.nft_table:
+        ok("nft", "delete", "table", "ip", st.nft_table)
+
+
+# --------------------------------------------------------------------------
+# DHCP and DNS
+# --------------------------------------------------------------------------
+
+def start_dnsmasq(cfg: ApConfig, st: State) -> None:
+    """dnsmasq with every setting on the command line.
+
+    Nothing is read from /etc/dnsmasq.conf: a system-wide config would other-
+    wise bind another interface or a port we did not ask for.  It also keeps
+    dnsmasq's own AppArmor profile out of the picture, since there is no
+    config file for it to be denied.
+    """
+    DNSMASQ_LEASES.parent.mkdir(parents=True, exist_ok=True)
     run(
         "dnsmasq",
+        "--conf-file=/dev/null",
         f"--pid-file={DNSMASQ_PID}",
+        f"--dhcp-leasefile={DNSMASQ_LEASES}",
         f"--interface={cfg.ap_iface}",
         "--bind-interfaces",
-        f"--dhcp-range={cfg.subnet}.10,{cfg.subnet}.200,12h",
-        f"--dhcp-option=3,{cfg.subnet}.1",
-        f"--dhcp-option=6,{cfg.subnet}.1",
         "--except-interface=lo",
-        f"--listen-address={cfg.subnet}.1",
+        f"--listen-address={cfg.gateway}",
+        f"--dhcp-range={cfg.subnet}.10,{cfg.subnet}.200,12h",
+        f"--dhcp-option=option:router,{cfg.gateway}",
+        f"--dhcp-option=option:dns-server,{cfg.gateway}",
+        "--dhcp-authoritative",
     )
+    st.dnsmasq_pid = _read_pid(DNSMASQ_PID)
 
 
-def start_hostapd(cfg: ApConfig) -> None:
-    run("systemd-run", f"--unit={HOSTAPD_UNIT}", "--quiet",
-        "--property=Restart=no", "/usr/sbin/hostapd", cfg.config_path)
-
-
-def hostapd_active() -> bool:
-    return run("systemctl", "is-active", "--quiet", HOSTAPD_UNIT, check=False).returncode == 0
-
-
-def hostapd_log(lines: int = 20) -> str:
-    return run("journalctl", "-u", HOSTAPD_UNIT, "-n", str(lines),
-               "--no-pager", check=False).stdout
-
-
-def teardown(cfg: ApConfig) -> None:
-    run("systemctl", "stop", HOSTAPD_UNIT, check=False)
-    run("systemctl", "reset-failed", HOSTAPD_UNIT, check=False)
+def _read_pid(path: Path) -> int:
     try:
-        with open(DNSMASQ_PID) as fh:
-            os.kill(int(fh.read().strip()), 15)
+        return int(path.read_text().strip())
     except (OSError, ValueError):
-        pass
+        return 0
+
+
+# --------------------------------------------------------------------------
+# hostapd
+# --------------------------------------------------------------------------
+
+def _has_systemd() -> bool:
+    return which("systemd-run") is not None and Path("/run/systemd/system").is_dir()
+
+
+def start_hostapd(cfg: ApConfig, config_path: str, st: State) -> None:
+    hostapd = which("hostapd")
+    if hostapd is None:
+        raise BackendError("hostapd is not installed")
+
+    if _has_systemd():
+        run("systemctl", "reset-failed", HOSTAPD_UNIT, check=False)
+        run("systemd-run", f"--unit={HOSTAPD_UNIT}", "--quiet",
+            "--property=Restart=no", hostapd, config_path)
+        st.hostapd_unit = HOSTAPD_UNIT
+        return
+
+    HOSTAPD_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(HOSTAPD_LOG, "wb")
     try:
-        os.unlink(DNSMASQ_PID)
+        proc = subprocess.Popen([hostapd, config_path], stdout=log, stderr=log,
+                                start_new_session=True)
+    except OSError as exc:
+        raise BackendError(f"hostapd: {exc}") from exc
+    st.hostapd_pid = proc.pid
+
+
+def hostapd_active(st: State | None = None) -> bool:
+    if st is None:
+        return ok("systemctl", "is-active", "--quiet", HOSTAPD_UNIT)
+    if st.hostapd_pid:
+        return _pid_alive(st.hostapd_pid)
+    if st.hostapd_unit:
+        return ok("systemctl", "is-active", "--quiet", st.hostapd_unit)
+    return False
+
+
+def hostapd_log(st: State | None = None, lines: int = 25) -> str:
+    if st is not None and st.hostapd_pid:
+        try:
+            return "\n".join(HOSTAPD_LOG.read_text().splitlines()[-lines:])
+        except OSError:
+            return ""
+    unit = (st.hostapd_unit if st else "") or HOSTAPD_UNIT
+    return run("journalctl", "-u", unit, "-n", str(lines), "--no-pager",
+               check=False).stdout
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_pid(pid: int, timeout: float = 5.0) -> None:
+    if not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
     except OSError:
-        pass
-    _nat_down(cfg)
-    run("iw", "dev", cfg.ap_iface, "del", check=False)
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
     try:
-        os.unlink(cfg.config_path)
+        os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
 
 
-def clients(cfg: ApConfig) -> list[str]:
-    out = run("ip", "neigh", "show", "dev", cfg.ap_iface, check=False).stdout
-    return [l for l in out.splitlines() if l.strip() and "FAILED" not in l]
+# --------------------------------------------------------------------------
+# who is connected
+# --------------------------------------------------------------------------
+
+@dataclass
+class Station:
+    mac: str
+    hostname: str = ""
+    ip: str = ""
+    signal: str = ""
+
+
+def stations(st: State) -> list[Station]:
+    """Associated clients, enriched with DHCP lease information."""
+    out = run("iw", "dev", st.ap_iface, "station", "dump", check=False).stdout
+    found: list[Station] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Station "):
+            found.append(Station(mac=line.split()[1]))
+        elif found and line.startswith("signal:"):
+            found[-1].signal = line.split(":", 1)[1].strip().split()[0] + " dBm"
+
+    leases = _leases()
+    for station in found:
+        ip, hostname = leases.get(station.mac.lower(), ("", ""))
+        station.ip, station.hostname = ip, hostname
+    return found
+
+
+def _leases() -> dict[str, tuple[str, str]]:
+    """mac -> (ip, hostname) from the dnsmasq lease file."""
+    try:
+        text = DNSMASQ_LEASES.read_text()
+    except OSError:
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            out[parts[1].lower()] = (parts[2], "" if parts[3] == "*" else parts[3])
+    return out
+
+
+# --------------------------------------------------------------------------
+# teardown
+# --------------------------------------------------------------------------
+
+def teardown(st: State) -> list[str]:
+    """Undo exactly what this run did.  Never raises; reports what failed."""
+    problems: list[str] = []
+
+    if st.hostapd_unit:
+        ok("systemctl", "stop", st.hostapd_unit)
+        ok("systemctl", "reset-failed", st.hostapd_unit)
+    if st.hostapd_pid:
+        _stop_pid(st.hostapd_pid)
+
+    if st.dnsmasq_pid:
+        _stop_pid(st.dnsmasq_pid)
+    DNSMASQ_PID.unlink(missing_ok=True)
+
+    _nat_down(st)
+
+    if st.did_ip_forward:
+        try:
+            IP_FORWARD.write_text(st.did_ip_forward + "\n")
+        except OSError as exc:
+            problems.append(f"could not restore ip_forward: {exc}")
+
+    if st.did_create_iface and interface_exists(st.ap_iface):
+        if not ok("iw", "dev", st.ap_iface, "del"):
+            problems.append(f"could not remove interface {st.ap_iface}")
+
+    nm_restore(st)
+
+    if st.did_write_config and st.config_path:
+        try:
+            os.unlink(st.config_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            problems.append(f"could not remove {st.config_path}: {exc}")
+
+    # Leave nothing behind in /run: a stale lease file would otherwise outlive
+    # the hotspot that wrote it.
+    for leftover in (DNSMASQ_LEASES, HOSTAPD_LOG):
+        leftover.unlink(missing_ok=True)
+    st.clear()
+    try:
+        STATE_DIR.rmdir()
+    except OSError:
+        pass          # something else is in there; leaving it is the safe choice
+    return problems
